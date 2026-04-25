@@ -2,7 +2,8 @@ import math
 import numpy as np
 import torch
 from ase import Atoms
-from ase.optimize import FIRE
+from ase.optimize import FIRE, LBFGS
+from ase.geometry import get_distances
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary, ZeroRotation
 from ase.filters import ExpCellFilter
@@ -10,11 +11,35 @@ from ase import units
 from mace.calculators import mace_mp
 from tqdm import tqdm
 
+on_cuda = False
+
 print(f"Czy CUDA jest dostępne? {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"Karta graficzna: {torch.cuda.get_device_name(0)}")
+    on_cuda = True
 else:
     print("UWAGA: Brak CUDA! Obliczenia będą szły wolno w chuj.")
+
+def remove_overlaps(atoms, min_dist=1.5, iterations=20):
+    for _ in range(iterations):
+        pos = atoms.get_positions()
+        moved = False
+
+        for i in range(len(atoms)):
+            for j in range(i+1, len(atoms)):
+                rij = pos[j] - pos[i]
+                d = np.linalg.norm(rij)
+
+                if d < min_dist:
+                    shift = (min_dist - d) * rij / d * 0.5
+                    pos[i] -= shift
+                    pos[j] += shift
+                    moved = True
+
+        atoms.set_positions(pos)
+
+        if not moved:
+            break
 
 def setup_glass_cell(moles_Li2O, moles_MgO, moles_Bi2O3, moles_SiO2, target_atoms=1000, density_g_cm3=1.8):
     total_moles = moles_Li2O + moles_MgO + moles_Bi2O3 + moles_SiO2
@@ -63,21 +88,25 @@ def setup_glass_cell(moles_Li2O, moles_MgO, moles_Bi2O3, moles_SiO2, target_atom
 
     return atoms
 
-target_atoms_count = 50 
+target_atoms_count = 50
+poczatkowa_gestosc = 3.8
 docelowa_gestosc = 4.5
 
 atoms = setup_glass_cell(moles_Li2O=20, moles_MgO=20, moles_Bi2O3=10, moles_SiO2=50,
-                         target_atoms=target_atoms_count, density_g_cm3=1.8)
+                         target_atoms=target_atoms_count, density_g_cm3=poczatkowa_gestosc)
 atoms.write("1_start_loose.xyz")
 
-calculator = mace_mp(model="medium", dispersion=False, default_dtype="float32", device="cuda")
+calculator = mace_mp(model="medium", dispersion=False, default_dtype="float32", device="cuda" if on_cuda else "cpu")
 atoms.calc = calculator
 
-print("\nMinimalizacja geometrii początkowej...")
-opt = FIRE(atoms, maxmove=0.15)
+dyn = Langevin(atoms, 0.5*units.fs, temperature_K=5000, friction=0.05)
+dyn.run(500)
 
+print("\nMinimalizacja geometrii początkowej...")
 max_opt_steps = 1000
-opt.run(fmax=1.0, steps=max_opt_steps) 
+remove_overlaps(atoms)
+opt = LBFGS(atoms, maxstep=0.05)
+opt.run(fmax=0.05, steps=2000)
 atoms.write("2_minimized_loose.xyz")
 
 forces = atoms.get_forces()
@@ -116,11 +145,11 @@ for i in tqdm(range(cycles_comp), desc="Kompresja", unit="cykl"):
     dyn.run(steps_per_comp)
 
 print("\nRównoważenie stopionego szkła w docelowej gęstości...")
-dyn.run(steps=5000)
+dyn.run(steps=20000)
 atoms.write("3_melted_compressed.xyz")
 
 T_final = 300
-steps_quench_total = 20000
+steps_quench_total = 100000
 steps_per_cycle = 200
 cycles = steps_quench_total // steps_per_cycle
 T_step = (T_melt - T_final) / cycles
@@ -139,7 +168,7 @@ print("\nKońcowa relaksacja komórki i atomów...")
 
 box_relax = ExpCellFilter(atoms)
 opt_final = FIRE(box_relax, maxmove=0.1)
-opt_final.run(fmax=0.05, steps=2000)
+opt_final.run(fmax=2.5, steps=2000)
 
 final_vol = atoms.get_volume()
 final_density = (atoms.get_masses().sum() * 1.660539e-24) / (final_vol * 1e-24)
