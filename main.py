@@ -99,14 +99,14 @@ atoms.write("1_start_loose.xyz")
 calculator = mace_mp(model="medium", dispersion=False, default_dtype="float32", device="cuda" if on_cuda else "cpu")
 atoms.calc = calculator
 
-dyn = Langevin(atoms, 0.5*units.fs, temperature_K=5000, friction=0.05)
-dyn.run(500)
+# dyn = Langevin(atoms, 0.5*units.fs, temperature_K=5000, friction=0.05)
+# dyn.run(500)
 
 print("\nMinimalizacja geometrii początkowej...")
 max_opt_steps = 1000
 remove_overlaps(atoms)
 opt = LBFGS(atoms, maxstep=0.05)
-opt.run(fmax=0.05, steps=2000)
+opt.run(fmax=5, steps=2000)
 atoms.write("2_minimized_loose.xyz")
 
 forces = atoms.get_forces()
@@ -117,7 +117,7 @@ if current_fmax > 10.0:
     raise RuntimeError("Geometria nadal bardzo zła (fmax > 10)")
 
 T_melt = 3500
-timestep = 1.0 * units.fs 
+timestep = 1.0 * units.fs
 
 MaxwellBoltzmannDistribution(atoms, temperature_K=T_melt)
 Stationary(atoms)
