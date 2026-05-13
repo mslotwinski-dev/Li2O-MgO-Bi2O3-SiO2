@@ -1,6 +1,7 @@
 import math
 import numpy as np
 import torch
+import argparse
 from ase import Atoms
 from ase.optimize import FIRE, LBFGS
 from ase.geometry import get_distances
@@ -12,6 +13,24 @@ from mace.calculators import mace_mp
 from tqdm import tqdm
 
 on_cuda = False
+
+parser = argparse.ArgumentParser(
+    description="Symulacja MD dla domieszkowanego układu szklistego Li2O-MgO-Bi2O3-SiO2 przy użyciu MACE.")
+
+parser.add_argument(
+    '--doping',
+    type=str,
+    default='LiF',
+    help="Materiał domieszkowania."
+)
+parser.add_argument(
+    '--amount',
+    type=int,
+    help="Ilość moli domieszkowania [0-20).",
+    default='0'
+)
+
+args = parser.parse_args()
 
 print(f"Czy CUDA jest dostępne? {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -41,28 +60,52 @@ def remove_overlaps(atoms, min_dist=1.5, iterations=20):
         if not moved:
             break
 
-def setup_glass_cell(moles_Li2O, moles_MgO, moles_Bi2O3, moles_SiO2, target_atoms=1000, density_g_cm3=1.8):
-    total_moles = moles_Li2O + moles_MgO + moles_Bi2O3 + moles_SiO2
-    n_Li = (2 * moles_Li2O) / total_moles
-    n_Mg = (1 * moles_MgO) / total_moles
-    n_Bi = (2 * moles_Bi2O3) / total_moles
-    n_Si = (1 * moles_SiO2) / total_moles
-    n_O = (1 * moles_Li2O + 1 * moles_MgO + 3 * moles_Bi2O3 + 2 * moles_SiO2) / total_moles
-    total_fraction = n_Li + n_Mg + n_Bi + n_Si + n_O
+def setup_glass_cell(moles_Li2O, moles_MgO, moles_Bi2O3, moles_SiO2, dopant_type=None, moles_dopant=0, target_atoms=1000, density_g_cm3=1.8):
+    dopant_stoich = {
+        'LiF':  {'Li': 1, 'F': 1},
+        'LiCl': {'Li': 1, 'Cl': 1},
+        'LiI':  {'Li': 1, 'I': 1},
+        'Li2S': {'Li': 2, 'S': 1}
+    }
 
-    count_Li = int(np.round((n_Li / total_fraction) * target_atoms))
-    count_Mg = int(np.round((n_Mg / total_fraction) * target_atoms))
-    count_Bi = int(np.round((n_Bi / total_fraction) * target_atoms))
-    count_Si = int(np.round((n_Si / total_fraction) * target_atoms))
-    count_O = target_atoms - (count_Li + count_Mg + count_Bi + count_Si)
+    atoms_dict = {
+        'Li': 2 * moles_Li2O,
+        'Mg': 1 * moles_MgO,
+        'Bi': 2 * moles_Bi2O3,
+        'Si': 1 * moles_SiO2,
+        'O':  1 * moles_Li2O + 1 * moles_MgO + 3 * moles_Bi2O3 + 2 * moles_SiO2
+    }
 
-    symbols = ['Li']*count_Li + ['Mg']*count_Mg + ['Bi']*count_Bi + ['Si']*count_Si + ['O']*count_O
+    if dopant_type and moles_dopant > 0:
+        if dopant_type not in dopant_stoich:
+            raise ValueError(f"Nieznana domieszka: {dopant_type}. Wybierz coś z {list(dopant_stoich.keys())}")
+        
+        for elem, count in dopant_stoich[dopant_type].items():
+            atoms_dict[elem] = atoms_dict.get(elem, 0) + count * moles_dopant
+
+    total_atoms_moles = sum(atoms_dict.values())
+    final_counts = {}
+    
+    for elem, moles in atoms_dict.items():
+        final_counts[elem] = int(np.round((moles / total_atoms_moles) * target_atoms))
+
+    current_total = sum(final_counts.values())
+    diff = target_atoms - current_total
+    if diff != 0:
+        max_elem = max(final_counts, key=final_counts.get)
+        final_counts[max_elem] += diff
+
+    symbols = []
+    for elem, count in final_counts.items():
+        if count > 0:
+            symbols += [elem] * count
+
     np.random.seed(42)
     np.random.shuffle(symbols)
 
-    print(f"Skład komórki: Li:{count_Li}, Mg:{count_Mg}, Bi:{count_Bi}, Si:{count_Si}, O:{count_O}")
+    comp_str = ", ".join([f"{k}:{v}" for k, v in final_counts.items() if v > 0])
+    print(f"Skład komórki: {comp_str}")
 
-    # Dokładna masa całkowita
     temp_atoms = Atoms(symbols)
     total_mass_amu = temp_atoms.get_masses().sum()
 
@@ -92,15 +135,17 @@ target_atoms_count = 50
 poczatkowa_gestosc = 3.8
 docelowa_gestosc = 4.5
 
-atoms = setup_glass_cell(moles_Li2O=20, moles_MgO=20, moles_Bi2O3=10, moles_SiO2=50,
-                         target_atoms=target_atoms_count, density_g_cm3=poczatkowa_gestosc)
+x = args.amount 
+typ_domieszki = args.doping 
+
+if 20 < x:
+    raise ValueError("Wartość x jest większa niż początkowa ilość Li2O!")
+
+atoms = setup_glass_cell(moles_Li2O=20 - x, moles_MgO=20, moles_Bi2O3=10, moles_SiO2=50, dopant_type=typ_domieszki, moles_dopant=x, target_atoms=target_atoms_count, density_g_cm3=poczatkowa_gestosc)
 atoms.write("1_start_loose.xyz")
 
-calculator = mace_mp(model="medium", dispersion=False, default_dtype="float32", device="cuda" if on_cuda else "cpu")
+calculator = mace_mp(model="medium", dispersion=False, default_dtype="float64", device="cuda" if on_cuda else "cpu")
 atoms.calc = calculator
-
-# dyn = Langevin(atoms, 0.5*units.fs, temperature_K=5000, friction=0.05)
-# dyn.run(500)
 
 print("\nMinimalizacja geometrii początkowej...")
 max_opt_steps = 1000
@@ -174,5 +219,9 @@ final_vol = atoms.get_volume()
 final_density = (atoms.get_masses().sum() * 1.660539e-24) / (final_vol * 1e-24)
 print(f"\nGęstość po schłodzeniu i końcowej relaksacji: {final_density:.2f} g/cm3")
 
-atoms.write("Li2O-MgO-Bi2O3-SiO2_final.xyz")
+
+domieszka = f"{typ_domieszki}-{x}_" if x > 0 else ""
+nazwa = f"Li2O_MgO_Bi2O3_SiO2_{domieszka}final.xyz"
+
+atoms.write(nazwa)
 print("Sukces! Gotowe.")
